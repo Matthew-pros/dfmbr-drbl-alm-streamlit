@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from pathlib import Path
 
 CORE_ASSETS = ["SPY", "QQQ", "XLK", "XLY", "XLI", "XLV", "XLF", "XLE", "XLP", "XLU"]
@@ -28,6 +27,13 @@ ASSET_PARAMS = {
 
 
 def fetch_data(start, end, tickers):
+    try:
+        import yfinance as yf
+    except Exception as exc:
+        raise RuntimeError(
+            "yfinance could not be imported on this Streamlit environment. "
+            "Please check the app logs and ensure requirements.txt was installed."
+        ) from exc
     tickers = sorted(set(tickers + [BENCHMARK]))
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
     if not isinstance(raw.columns, pd.MultiIndex):
