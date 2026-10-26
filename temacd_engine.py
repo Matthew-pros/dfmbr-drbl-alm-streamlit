@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from pathlib import Path
 
 CORE_ASSETS = ["SPY", "QQQ", "XLK", "XLY", "XLI", "XLV", "XLF", "XLE", "XLP", "XLU"]
 AGGRESSIVE_ASSETS = ["TQQQ", "SOXL", "SMH", "BTC-USD", "ETH-USD", "SOL-USD"]
@@ -13,6 +14,16 @@ DEFAULT_TEMACD = {
     "macd_fast": 30,
     "macd_slow": 80,
     "macd_signal": 15,
+}
+
+ASSET_PARAMS = {
+    "QQQ": {"ema_fast": 10, "ema_slow": 120, "macd_fast": 30, "macd_slow": 80, "macd_signal": 15},
+    "SPY": {"ema_fast": 10, "ema_slow": 150, "macd_fast": 30, "macd_slow": 90, "macd_signal": 15},
+    "TQQQ": {"ema_fast": 8, "ema_slow": 100, "macd_fast": 25, "macd_slow": 70, "macd_signal": 12},
+    "SOXL": {"ema_fast": 8, "ema_slow": 100, "macd_fast": 25, "macd_slow": 70, "macd_signal": 12},
+    "BTC-USD": {"ema_fast": 12, "ema_slow": 150, "macd_fast": 35, "macd_slow": 90, "macd_signal": 15},
+    "ETH-USD": {"ema_fast": 12, "ema_slow": 150, "macd_fast": 35, "macd_slow": 90, "macd_signal": 15},
+    "SOL-USD": {"ema_fast": 12, "ema_slow": 150, "macd_fast": 35, "macd_slow": 90, "macd_signal": 15},
 }
 
 
@@ -47,11 +58,7 @@ def rsi(series, n=14):
 
 
 def atr_percent(high, low, close, n=20):
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean() / close
 
 
@@ -62,26 +69,21 @@ def temacd(close, params=None):
     macd_line = fast - slow
     signal = ema(macd_line, p["macd_signal"])
     histogram = macd_line - signal
-    trend_filter = close > ema(close, p["ema_slow"])
-    return {
-        "macd": macd_line,
-        "signal": signal,
-        "histogram": histogram,
-        "trend_ok": trend_filter,
-    }
+    trend_ok = close > ema(close, p["ema_slow"])
+    return {"macd": macd_line, "signal": signal, "histogram": histogram, "trend_ok": trend_ok}
 
 
 def momentum_score(close, indicators):
-    hist_z = (indicators["histogram"] - indicators["histogram"].rolling(60).mean()) / (
-        indicators["histogram"].rolling(60).std() + 1e-12
-    )
+    hist = indicators["histogram"]
+    hist_z = (hist - hist.rolling(60).mean()) / (hist.rolling(60).std() + 1e-12)
     rsi_score = (rsi(close) - 50) / 50
     return 0.6 * hist_z + 0.4 * rsi_score
 
 
-def compute_indicators(close, high, low, params=None):
+def compute_indicators(close, high, low):
     indicators = {}
     for ticker in close.columns:
+        params = ASSET_PARAMS.get(ticker, DEFAULT_TEMACD)
         ind = temacd(close[ticker], params)
         ind["rsi"] = rsi(close[ticker])
         ind["atr_pct"] = atr_percent(high[ticker], low[ticker], close[ticker])
@@ -116,22 +118,19 @@ def select_portfolio(date, close, indicators, top_n, universe):
 
 
 def atr_weights(selected, date, indicators, risk_unit, max_weight):
-    raw_weights = {}
+    weights = {}
     for ticker in selected:
         atrp = float(indicators[ticker]["atr_pct"].loc[date])
-        if atrp <= 0 or np.isnan(atrp):
-            raw_weights[ticker] = 0.0
-        else:
-            raw_weights[ticker] = min(risk_unit / atrp, max_weight)
-    total = sum(raw_weights.values())
+        weights[ticker] = 0.0 if atrp <= 0 or np.isnan(atrp) else min(risk_unit / atrp, max_weight)
+    total = sum(weights.values())
     if total > 1:
-        raw_weights = {k: v / total for k, v in raw_weights.items()}
-    return raw_weights
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
 
 
 def backtest(close, high, low, params):
     universe = params["universe"]
-    indicators = compute_indicators(close, high, low, params.get("temacd"))
+    indicators = compute_indicators(close, high, low)
     dates = close.index
     rebalances = rebalance_dates(dates, params["frequency"])
     weights = {}
@@ -159,8 +158,7 @@ def backtest(close, high, low, params):
             prev_weights = new_weights
         equity_curve.append({"date": date, "equity": equity})
     result = pd.DataFrame(equity_curve).set_index("date")
-    benchmark_equity = params["initial_capital"] * (1 + returns[BENCHMARK]).cumprod()
-    result["benchmark"] = benchmark_equity.reindex(result.index).ffill()
+    result["benchmark"] = params["initial_capital"] * (1 + returns[BENCHMARK]).cumprod().reindex(result.index).ffill()
     return result, pd.DataFrame(rebalance_log), indicators
 
 
@@ -176,14 +174,13 @@ def performance(equity):
     gross_profit = returns[returns > 0].sum()
     gross_loss = abs(returns[returns < 0].sum())
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-    win_rate = (returns > 0).mean()
     return {
         "CAGR": cagr,
         "MaxDD": dd.min(),
         "Sharpe": sharpe,
         "Sortino": sortino,
         "ProfitFactor": profit_factor,
-        "WinRate": win_rate,
+        "WinRate": (returns > 0).mean(),
         "NetProfit": equity.iloc[-1] / equity.iloc[0] - 1,
     }
 
@@ -210,3 +207,48 @@ def period_metrics(result):
             "SPY Net Profit": benchmark["NetProfit"],
         })
     return pd.DataFrame(rows)
+
+
+def walk_forward_metrics(result, windows=6):
+    returns = result["equity"].pct_change().dropna()
+    n = len(returns)
+    if n < windows * 126:
+        return pd.DataFrame()
+    fold_size = n // windows
+    rows = []
+    for i in range(windows):
+        window = returns.iloc[i * fold_size:(i + 1) * fold_size]
+        equity = (1 + window).cumprod()
+        metrics = performance(equity)
+        rows.append({"Fold": i + 1, "Start": window.index[0], "End": window.index[-1], **metrics})
+    return pd.DataFrame(rows)
+
+
+def monte_carlo(result, simulations=5000, seed=42):
+    returns = result["equity"].pct_change().dropna().values
+    if len(returns) < 252:
+        return pd.DataFrame()
+    rng = np.random.default_rng(seed)
+    paths = rng.choice(returns, size=(simulations, len(returns)), replace=True)
+    equity = 100 * np.cumprod(1 + paths, axis=1)
+    peak = np.maximum.accumulate(np.column_stack([np.full(simulations, 100), equity]), axis=1)[:, 1:]
+    drawdown = (equity - peak) / peak
+    return pd.DataFrame([{
+        "Simulations": simulations,
+        "Median Final Equity": np.median(equity[:, -1]),
+        "5th Percentile Final Equity": np.percentile(equity[:, -1], 5),
+        "95th Percentile Final Equity": np.percentile(equity[:, -1], 95),
+        "Median MaxDD": np.median(drawdown.min(axis=1)),
+        "5th Percentile MaxDD": np.percentile(drawdown.min(axis=1), 5),
+        "Risk of Ruin Below 50": (equity[:, -1] < 50).mean(),
+    }])
+
+
+def export_results(result, rebalance_log, prefix="temacd"):
+    output = Path("exports")
+    output.mkdir(exist_ok=True)
+    equity_path = output / f"{prefix}_equity.csv"
+    rebalance_path = output / f"{prefix}_rebalances.csv"
+    result.to_csv(equity_path)
+    rebalance_log.to_csv(rebalance_path, index=False)
+    return equity_path, rebalance_path
