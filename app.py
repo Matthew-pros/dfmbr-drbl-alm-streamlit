@@ -1,61 +1,91 @@
 import streamlit as st
 import pandas as pd
-from strategy_engine import fetch_data, backtest, performance
+from temacd_engine import (
+    CORE_ASSETS,
+    AGGRESSIVE_ASSETS,
+    fetch_data,
+    backtest,
+    period_metrics,
+)
 
-st.set_page_config(page_title="DFMBR + DRBL + ALM", layout="wide")
-st.title("DFMBR + DRBL + ALM Strategy")
-st.caption("Monthly rotation across QQQ / SPY / GLD / BTC with dynamic leverage and ALM entry.")
+st.set_page_config(page_title="TEMACD Volatility-Sized Rotation", layout="wide")
+st.title("TEMACD Volatility-Sized Sector & Beta Rotation")
+st.caption("Daily yfinance data, TEMACD momentum selection, ATR risk-parity sizing and SPY benchmark.")
 
 with st.sidebar:
-    st.header("Parameters")
+    st.header("Strategy settings")
+    universe_name = st.selectbox("Asset universe", ["Core ETFs", "Aggressive", "Combined"])
+    if universe_name == "Core ETFs":
+        universe = CORE_ASSETS
+    elif universe_name == "Aggressive":
+        universe = AGGRESSIVE_ASSETS
+    else:
+        universe = CORE_ASSETS + AGGRESSIVE_ASSETS
+
     start = st.date_input("Start date", pd.Timestamp("2015-01-01"))
     initial_capital = st.number_input("Initial capital", 10000, 100000000, 100000, 10000)
-    commission_bps = st.number_input("Commission (bps)", 0.0, 100.0, 5.0, 0.5)
-    slippage_bps = st.number_input("Slippage (bps)", 0.0, 100.0, 5.0, 0.5)
-    adx_threshold = st.slider("ADX threshold for 3x", 15, 40, 25)
-    rvol_threshold = st.slider("Rvol threshold for 3x", 1.0, 2.5, 1.4, 0.1)
-    atr_percentile = st.slider("ATR percentile limit for 3x", 50, 99, 90)
-    momentum_buffer = st.slider("Momentum buffer", 0.0, 0.25, 0.08, 0.01)
-    lrs_window = st.slider("LRS window", 50, 200, 100, 10)
-    cash_reserve = st.slider("Permanent cash reserve", 0.0, 0.30, 0.15, 0.01)
+    top_n = st.slider("Top N assets", 1, 6, 3)
+    frequency = st.selectbox("Rebalance frequency", ["Weekly", "Monthly"])
+    risk_unit = st.slider("Risk unit per position", 0.25, 3.0, 1.0, 0.25) / 100
+    max_weight = st.slider("Maximum weight per asset", 0.10, 1.00, 0.35, 0.05)
+    cost_bps = st.number_input("Transaction cost (bps per turnover)", 0.0, 100.0, 5.0, 0.5)
     run = st.button("Run backtest", type="primary")
 
 params = {
+    "universe": universe,
     "initial_capital": initial_capital,
-    "commission_bps": commission_bps,
-    "slippage_bps": slippage_bps,
-    "adx_threshold": adx_threshold,
-    "rvol_threshold": rvol_threshold,
-    "atr_percentile": atr_percentile / 100,
-    "momentum_buffer": momentum_buffer,
-    "lrs_window": lrs_window,
-    "cash_reserve": cash_reserve,
-    "alm_tier_1": -0.80,
-    "alm_tier_2": -0.50,
-    "alm_tier_3": -0.30,
-    "alm_alloc_1": 0.50,
-    "alm_alloc_2": 0.20,
-    "alm_alloc_3": 0.15,
+    "top_n": top_n,
+    "frequency": frequency,
+    "risk_unit": risk_unit,
+    "max_weight": max_weight,
+    "cost_bps": cost_bps,
+    "temacd": None,
 }
 
 if run:
-    with st.spinner("Downloading data and running backtest..."):
-        close, volume, ohlcv = fetch_data(str(start), pd.Timestamp.today().strftime("%Y-%m-%d"))
-        result, trades = backtest(close, volume, ohlcv, params)
-    metrics = performance(result["equity"])
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("CAGR", f"{metrics['CAGR'] * 100:.2f}%")
-    c2.metric("Sharpe", f"{metrics['Sharpe']:.2f}")
-    c3.metric("Max Drawdown", f"{metrics['MaxDrawdown'] * 100:.2f}%")
-    c4.metric("Final equity", f"{metrics['FinalEquity']:,.0f}")
-    st.subheader("Equity curve")
-    st.line_chart(result["equity"])
-    st.subheader("Current allocation")
-    last = result.iloc[-1]
-    st.write(f"**Leader:** {last['leader']}")
-    st.write(f"**Position:** {last['position']}")
-    st.write(f"**Leverage:** {last['leverage']}x")
-    st.subheader("Trades")
-    st.dataframe(trades, use_container_width=True)
+    with st.spinner("Downloading daily yfinance data and running backtest..."):
+        close, high, low = fetch_data(str(start), pd.Timestamp.today().strftime("%Y-%m-%d"), universe)
+        result, rebalance_log, indicators = backtest(close, high, low, params)
+
+    st.subheader("Equity curve vs SPY Buy & Hold")
+    st.line_chart(result[["equity", "benchmark"]])
+
+    st.subheader("Performance by period")
+    metrics = period_metrics(result)
+    if metrics.empty:
+        st.warning("Not enough history for the requested periods.")
+    else:
+        st.dataframe(
+            metrics.style.format({
+                "Strategy CAGR": "{:.2%}",
+                "Strategy MaxDD": "{:.2%}",
+                "Strategy Sharpe": "{:.2f}",
+                "Strategy Sortino": "{:.2f}",
+                "Strategy Profit Factor": "{:.2f}",
+                "Strategy Net Profit": "{:.2%}",
+                "SPY CAGR": "{:.2%}",
+                "SPY MaxDD": "{:.2%}",
+                "SPY Net Profit": "{:.2%}",
+            }),
+            use_container_width=True,
+        )
+
+    st.subheader("Current eligible signals")
+    signal_rows = []
+    for ticker in universe:
+        if ticker not in indicators:
+            continue
+        ind = indicators[ticker]
+        signal_rows.append({
+            "Ticker": ticker,
+            "Trend OK": bool(ind["trend_ok"].iloc[-1]),
+            "TEMACD Bullish": bool(ind["macd"].iloc[-1] > ind["signal"].iloc[-1]),
+            "Momentum Score": float(ind["score"].iloc[-1]),
+            "ATR %": float(ind["atr_pct"].iloc[-1]),
+        })
+    st.dataframe(pd.DataFrame(signal_rows), use_container_width=True)
+
+    st.subheader("Rebalance log")
+    st.dataframe(rebalance_log, use_container_width=True)
 else:
-    st.info("Set parameters in the sidebar and run the backtest.")
+    st.info("Set strategy settings in the sidebar and run the backtest.")
